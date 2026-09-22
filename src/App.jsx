@@ -41,6 +41,10 @@ export default function InventoryApp() {
   const [flavorBarcodeForm, setFlavorBarcodeForm] = useState({ code: "", mode: null, unitsPerCase: "", name: "" });
   const flavorBarcodeInputRef = useRef(null);
 
+  // Editing a previously created flavor.
+  const [editFlavorId, setEditFlavorId] = useState("");
+  const [editFlavorForm, setEditFlavorForm] = useState({ name: "", unitsPerCase: "" });
+
   const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState(null); // { type: 'ok'|'err', text }
 
@@ -157,7 +161,7 @@ export default function InventoryApp() {
       if (mode === "upc") {
         const match = upcCodes.find((u) => u.upc === trimmed);
         next.flavor_id = match ? match.flavor_id : "";
-        next.cases = "1";
+        if (modeChanged) next.cases = "1";
         if (modeChanged) next.lot = "";
       } else if (mode === "internal") {
         if (modeChanged) {
@@ -194,9 +198,9 @@ export default function InventoryApp() {
       showToast("err", "Lot # is required.");
       return;
     }
-    const cases = mode === "upc" ? 1 : Number(barcodeForm.cases);
+    const cases = Number(barcodeForm.cases);
     if (!cases || cases <= 0) {
-      showToast("err", "Cases received must be above zero.");
+      showToast("err", mode === "upc" ? "Quantity must be above zero." : "Cases received must be above zero.");
       return;
     }
     setSubmitting(true);
@@ -304,6 +308,41 @@ export default function InventoryApp() {
     } finally {
       setSubmitting(false);
       flavorBarcodeInputRef.current?.focus();
+    }
+  }
+
+  function handleSelectEditFlavor(id) {
+    setEditFlavorId(id);
+    const f = flavors.find((fl) => fl.id === id);
+    setEditFlavorForm(f ? { name: f.name, unitsPerCase: String(f.units_per_case) } : { name: "", unitsPerCase: "" });
+  }
+
+  async function submitFlavorEdit() {
+    if (!editFlavorId) {
+      showToast("err", "Select a flavor to edit.");
+      return;
+    }
+    if (!editFlavorForm.name.trim()) {
+      showToast("err", "Flavor name can't be blank.");
+      return;
+    }
+    const units = Number(editFlavorForm.unitsPerCase);
+    if (!units || units <= 0) {
+      showToast("err", "Units per case must be above zero.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await sbFetch(`flavors?id=eq.${editFlavorId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: editFlavorForm.name.trim(), units_per_case: units }),
+      });
+      showToast("ok", "Flavor updated.");
+      loadData();
+    } catch (e) {
+      showToast("err", e.message || "Couldn't update that flavor.");
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -486,17 +525,45 @@ export default function InventoryApp() {
               </div>
 
               {barcodeForm.mode === "upc" && (
-                <div style={{ marginBottom: 16 }}>
-                  <label style={labelStyle}>Lot #</label>
-                  <input
-                    style={inputStyle}
-                    value={barcodeForm.lot}
-                    onChange={(e) => {
-                      setLotManuallyEdited(true);
-                      setBarcodeForm({ ...barcodeForm, lot: e.target.value });
-                    }}
-                    onKeyDown={(e) => e.key === "Enter" && submitInbound()}
-                  />
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 16 }}>
+                  <div>
+                    <label style={labelStyle}>Lot #</label>
+                    <input
+                      style={inputStyle}
+                      value={barcodeForm.lot}
+                      onChange={(e) => {
+                        setLotManuallyEdited(true);
+                        setBarcodeForm({ ...barcodeForm, lot: e.target.value });
+                      }}
+                      onKeyDown={(e) => e.key === "Enter" && submitInbound()}
+                    />
+                  </div>
+                  <div>
+                    <label style={labelStyle}>Quantity</label>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <button
+                        type="button"
+                        onClick={() => setBarcodeForm((p) => ({ ...p, cases: String(Math.max(0, Number(p.cases || 0) - 1)) }))}
+                        style={stepperBtnStyle}
+                      >
+                        <Minus size={14} />
+                      </button>
+                      <input
+                        style={{ ...inputStyle, textAlign: "center" }}
+                        type="number"
+                        min="0"
+                        value={barcodeForm.cases}
+                        onChange={(e) => setBarcodeForm({ ...barcodeForm, cases: e.target.value })}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setBarcodeForm((p) => ({ ...p, cases: String(Number(p.cases || 0) + 1) }))}
+                        style={stepperBtnStyle}
+                      >
+                        <Plus size={14} />
+                      </button>
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -656,6 +723,50 @@ export default function InventoryApp() {
                     </div>
                   ))}
                 </div>
+              )}
+            </div>
+          )}
+
+          {/* Edit an existing flavor */}
+          {tab === "flavor" && (
+            <div style={{ background: SURFACE, border: `1px solid ${BORDER}`, borderRadius: 8, padding: 20, marginBottom: 28 }}>
+              <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>Edit an existing flavor</div>
+              <div style={{ marginBottom: editFlavorId ? 14 : 0 }}>
+                <label style={labelStyle}>Flavor</label>
+                <select style={inputStyle} value={editFlavorId} onChange={(e) => handleSelectEditFlavor(e.target.value)}>
+                  <option value="">Select…</option>
+                  {flavors.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {editFlavorId && (
+                <>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14, marginBottom: 16 }}>
+                    <div>
+                      <label style={labelStyle}>Flavor name</label>
+                      <input
+                        style={inputStyle}
+                        value={editFlavorForm.name}
+                        onChange={(e) => setEditFlavorForm({ ...editFlavorForm, name: e.target.value })}
+                      />
+                    </div>
+                    <div>
+                      <label style={labelStyle}>Units per case</label>
+                      <input
+                        style={inputStyle}
+                        type="number"
+                        min="1"
+                        value={editFlavorForm.unitsPerCase}
+                        onChange={(e) => setEditFlavorForm({ ...editFlavorForm, unitsPerCase: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                  <SubmitButton submitting={submitting} label="Save changes" onClick={submitFlavorEdit} />
+                </>
               )}
             </div>
           )}
