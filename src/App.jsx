@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Settings, PackagePlus, PackageMinus, Plus, Minus, X, Loader2, Check, AlertCircle } from "lucide-react";
+import { Settings, PackagePlus, PackageMinus, Plus, X, Loader2, Check, AlertCircle, ClipboardList, ClipboardCheck, Send, Trash2 } from "lucide-react";
 
 const INK = "#2B2320";
 const PAPER = "#FAF6F0";
@@ -15,6 +15,7 @@ const monoFont = "ui-monospace, SFMono-Regular, Menlo, monospace";
 
 const CONFIG_KEY = "supabase-config";
 const UPC_PATTERN = /^\d{12}$/;
+const INTERNAL_CASE_SIZE = 72; // fixed macarons per case for internal-code receiving
 
 export default function InventoryApp() {
   const [config, setConfig] = useState(null); // { url, key }
@@ -28,22 +29,29 @@ export default function InventoryApp() {
   const [dataError, setDataError] = useState("");
   const [dataLoading, setDataLoading] = useState(false);
 
-  const [tab, setTab] = useState("in"); // 'in' | 'out' | 'flavor'
+  const [tab, setTab] = useState("in"); // 'in' | 'out' | 'flavor' | 'stock'
 
-  // Receive Stock is now barcode-driven rather than a flavor dropdown.
+  // Receive Stock is barcode-driven rather than a flavor dropdown.
   const [barcodeForm, setBarcodeForm] = useState({ code: "", mode: null, flavor_id: "", cases: "1", lot: "" });
   const [lotManuallyEdited, setLotManuallyEdited] = useState(false);
   const barcodeInputRef = useRef(null);
 
   const [outForm, setOutForm] = useState({ flavor_id: "", units: "", order: "", date: todayStr(), item: "" });
 
-  // Add Flavor is now barcode-driven, mirroring Receive Stock.
-  const [flavorBarcodeForm, setFlavorBarcodeForm] = useState({ code: "", mode: null, unitsPerCase: "", name: "" });
+  // Add Flavor is barcode-driven, mirroring Receive Stock.
+  const [flavorBarcodeForm, setFlavorBarcodeForm] = useState({ code: "", mode: null, unitsPerCase: "", name: "", sku: "" });
   const flavorBarcodeInputRef = useRef(null);
 
-  // Editing a previously created flavor.
+  // Editing / deleting a previously created flavor.
   const [editFlavorId, setEditFlavorId] = useState("");
   const [editFlavorForm, setEditFlavorForm] = useState({ name: "", unitsPerCase: "" });
+  const [confirmingDeleteFlavor, setConfirmingDeleteFlavor] = useState(false);
+
+  // Take Inventory — step-through physical count.
+  const [takingInventory, setTakingInventory] = useState(false);
+  const [inventoryStep, setInventoryStep] = useState(0);
+  const [inventoryCounts, setInventoryCounts] = useState({});
+  const [currentCountInput, setCurrentCountInput] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState(null); // { type: 'ok'|'err', text }
@@ -112,7 +120,7 @@ export default function InventoryApp() {
       const [f, inv, upcs] = await Promise.all([
         sbFetch("flavors?select=*&order=name.asc"),
         sbFetch("current_inventory?select=*&order=name.asc"),
-        sbFetch("upc_codes?select=upc,flavor_id"),
+        sbFetch("upc_codes?select=upc,flavor_id,sku"),
       ]);
       setFlavors(f || []);
       setInventory(inv || []);
@@ -203,6 +211,8 @@ export default function InventoryApp() {
       showToast("err", mode === "upc" ? "Quantity must be above zero." : "Cases received must be above zero.");
       return;
     }
+    const flavorObj = flavors.find((f) => f.id === barcodeForm.flavor_id);
+    const macaronsReceived = mode === "internal" ? cases * INTERNAL_CASE_SIZE : cases * (flavorObj?.units_per_case || 0);
     setSubmitting(true);
     try {
       await sbFetch("inbound_scans", {
@@ -211,12 +221,13 @@ export default function InventoryApp() {
           {
             flavor_id: barcodeForm.flavor_id,
             cases_received: cases,
+            macarons_received: macaronsReceived,
             lot_code: barcodeForm.lot.trim(),
             raw_code: barcodeForm.code.trim(),
           },
         ]),
       });
-      showToast("ok", "Logged. Cases added to stock.");
+      showToast("ok", "Logged. Macarons added to stock.");
       resetBarcodeForm();
       loadData();
     } catch (e) {
@@ -229,7 +240,7 @@ export default function InventoryApp() {
 
   async function submitOutbound() {
     if (!outForm.flavor_id || !outForm.units || Number(outForm.units) <= 0 || !outForm.order) {
-      showToast("err", "Pick a flavor, order number, and unit count above zero.");
+      showToast("err", "Pick a flavor, order number, and macaron count above zero.");
       return;
     }
     setSubmitting(true);
@@ -246,7 +257,7 @@ export default function InventoryApp() {
           },
         ]),
       });
-      showToast("ok", "Logged. Units removed from stock.");
+      showToast("ok", "Logged. Macarons removed from stock.");
       setOutForm({ flavor_id: outForm.flavor_id, units: "", order: "", date: outForm.date, item: "" });
       loadData();
     } catch (e) {
@@ -274,10 +285,15 @@ export default function InventoryApp() {
       showToast("err", "Enter the flavor name.");
       return;
     }
-    const units = Number(flavorBarcodeForm.unitsPerCase);
-    if (!units || units <= 0) {
-      showToast("err", mode === "upc" ? "Enter units per clamshell." : "Enter macarons per case.");
-      return;
+    let units;
+    if (mode === "upc") {
+      units = Number(flavorBarcodeForm.unitsPerCase);
+      if (!units || units <= 0) {
+        showToast("err", "Enter macarons per clamshell.");
+        return;
+      }
+    } else {
+      units = INTERNAL_CASE_SIZE;
     }
     setSubmitting(true);
     try {
@@ -296,12 +312,12 @@ export default function InventoryApp() {
       if (mode === "upc" && newFlavor) {
         await sbFetch("upc_codes", {
           method: "POST",
-          body: JSON.stringify([{ upc: flavorBarcodeForm.code.trim(), flavor_id: newFlavor.id }]),
+          body: JSON.stringify([{ upc: flavorBarcodeForm.code.trim(), flavor_id: newFlavor.id, sku: flavorBarcodeForm.sku.trim() || null }]),
         });
       }
 
       showToast("ok", `${flavorBarcodeForm.name.trim()} added.`);
-      setFlavorBarcodeForm({ code: "", mode: null, unitsPerCase: "", name: "" });
+      setFlavorBarcodeForm({ code: "", mode: null, unitsPerCase: "", name: "", sku: "" });
       loadData();
     } catch (e) {
       showToast("err", e.message || "Couldn't add that flavor.");
@@ -313,6 +329,7 @@ export default function InventoryApp() {
 
   function handleSelectEditFlavor(id) {
     setEditFlavorId(id);
+    setConfirmingDeleteFlavor(false);
     const f = flavors.find((fl) => fl.id === id);
     setEditFlavorForm(f ? { name: f.name, unitsPerCase: String(f.units_per_case) } : { name: "", unitsPerCase: "" });
   }
@@ -328,7 +345,7 @@ export default function InventoryApp() {
     }
     const units = Number(editFlavorForm.unitsPerCase);
     if (!units || units <= 0) {
-      showToast("err", "Units per case must be above zero.");
+      showToast("err", "Macarons per case must be above zero.");
       return;
     }
     setSubmitting(true);
@@ -344,6 +361,110 @@ export default function InventoryApp() {
     } finally {
       setSubmitting(false);
     }
+  }
+
+  async function submitFlavorDelete() {
+    if (!editFlavorId) return;
+    setSubmitting(true);
+    try {
+      // Remove any UPC link first — that's just metadata, not transactional history.
+      await sbFetch(`upc_codes?flavor_id=eq.${editFlavorId}`, { method: "DELETE" });
+      await sbFetch(`flavors?id=eq.${editFlavorId}`, { method: "DELETE" });
+      showToast("ok", "Flavor deleted.");
+      setEditFlavorId("");
+      setEditFlavorForm({ name: "", unitsPerCase: "" });
+      setConfirmingDeleteFlavor(false);
+      loadData();
+    } catch (e) {
+      const msg = /foreign key/i.test(e.message || "")
+        ? "Can't delete — this flavor already has receive/sale history, which is kept for accounting records."
+        : e.message || "Couldn't delete that flavor.";
+      showToast("err", msg);
+      setConfirmingDeleteFlavor(false);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function startTakeInventory() {
+    if (flavors.length === 0) {
+      showToast("err", "Add at least one flavor first.");
+      return;
+    }
+    setInventoryStep(0);
+    setInventoryCounts({});
+    setCurrentCountInput("");
+    setTakingInventory(true);
+  }
+
+  function cancelTakeInventory() {
+    setTakingInventory(false);
+    setInventoryStep(0);
+    setInventoryCounts({});
+    setCurrentCountInput("");
+  }
+
+  async function finishTakeInventory(counts) {
+    setSubmitting(true);
+    try {
+      const rows = flavors.map((f) => {
+        const counted = Number(counts[f.id] ?? 0);
+        const currentOnHand = inventory.find((i) => i.flavor_id === f.id)?.units_on_hand ?? 0;
+        return {
+          flavor_id: f.id,
+          counted_total: counted,
+          adjustment: counted - currentOnHand,
+        };
+      });
+      await sbFetch("inventory_adjustments", {
+        method: "POST",
+        body: JSON.stringify(rows),
+      });
+      showToast("ok", "Inventory updated.");
+      setTakingInventory(false);
+      setInventoryStep(0);
+      setInventoryCounts({});
+      setCurrentCountInput("");
+      loadData();
+    } catch (e) {
+      showToast("err", e.message || "Couldn't save the inventory count.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function handleInventoryNext() {
+    const flavor = flavors[inventoryStep];
+    const countNum = Number(currentCountInput);
+    if (currentCountInput === "" || Number.isNaN(countNum) || countNum < 0) {
+      showToast("err", "Enter the macarons on hand for this flavor.");
+      return;
+    }
+    const updatedCounts = { ...inventoryCounts, [flavor.id]: countNum };
+    setInventoryCounts(updatedCounts);
+    if (inventoryStep + 1 < flavors.length) {
+      setInventoryStep(inventoryStep + 1);
+      setCurrentCountInput("");
+    } else {
+      finishTakeInventory(updatedCounts);
+    }
+  }
+
+  function publishCsv() {
+    const header = ["Flavor", "Macarons Received", "Macarons Sold", "Adjustments (Shrink/Found)", "Macarons On Hand"];
+    const rows = inventory.map((row) => [row.name, row.units_received, row.units_sold, row.units_adjusted ?? 0, row.units_on_hand]);
+    const csvLines = [header, ...rows].map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","));
+    const csv = csvLines.join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `duverger-inventory-${todayStr()}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast("ok", "CSV downloaded — attach it to an email to admin@duvergermacarons.com.");
   }
 
   const inputStyle = {
@@ -367,18 +488,39 @@ export default function InventoryApp() {
     fontFamily: sansFont,
   };
 
-  const stepperBtnStyle = {
-    width: 34,
-    height: 34,
+  const secondaryBtnStyle = {
     display: "flex",
     alignItems: "center",
-    justifyContent: "center",
-    border: `1px solid ${BORDER}`,
+    gap: 7,
     background: SURFACE,
+    border: `1px solid ${BORDER}`,
     borderRadius: 6,
-    cursor: "pointer",
+    padding: "8px 14px",
+    fontSize: 13.5,
+    fontWeight: 600,
     color: INK,
-    flexShrink: 0,
+    cursor: "pointer",
+  };
+
+  const dangerOutlineBtnStyle = {
+    display: "flex",
+    alignItems: "center",
+    gap: 7,
+    background: SURFACE,
+    border: `1px solid ${BERRY}`,
+    color: BERRY,
+    borderRadius: 6,
+    padding: "10px 16px",
+    fontSize: 13.5,
+    fontWeight: 600,
+    cursor: "pointer",
+  };
+
+  const dangerBtnStyle = {
+    ...dangerOutlineBtnStyle,
+    background: BERRY,
+    color: "#fff",
+    border: "none",
   };
 
   if (configLoading) {
@@ -471,11 +613,12 @@ export default function InventoryApp() {
           )}
 
           {/* Tabs */}
-          <div style={{ display: "flex", gap: 22, borderBottom: `1px solid ${BORDER}`, marginBottom: 20 }}>
+          <div style={{ display: "flex", gap: 22, borderBottom: `1px solid ${BORDER}`, marginBottom: 20, flexWrap: "wrap" }}>
             {[
               { id: "in", label: "Receive stock", icon: PackagePlus },
               { id: "out", label: "Record sale", icon: PackageMinus },
               { id: "flavor", label: "Add flavor", icon: Plus },
+              { id: "stock", label: "Current stock", icon: ClipboardList },
             ].map((t) => (
               <button
                 key={t.id}
@@ -540,29 +683,13 @@ export default function InventoryApp() {
                   </div>
                   <div>
                     <label style={labelStyle}>Quantity</label>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <button
-                        type="button"
-                        onClick={() => setBarcodeForm((p) => ({ ...p, cases: String(Math.max(0, Number(p.cases || 0) - 1)) }))}
-                        style={stepperBtnStyle}
-                      >
-                        <Minus size={14} />
-                      </button>
-                      <input
-                        style={{ ...inputStyle, textAlign: "center" }}
-                        type="number"
-                        min="0"
-                        value={barcodeForm.cases}
-                        onChange={(e) => setBarcodeForm({ ...barcodeForm, cases: e.target.value })}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setBarcodeForm((p) => ({ ...p, cases: String(Number(p.cases || 0) + 1) }))}
-                        style={stepperBtnStyle}
-                      >
-                        <Plus size={14} />
-                      </button>
-                    </div>
+                    <input
+                      style={inputStyle}
+                      type="number"
+                      min="0"
+                      value={barcodeForm.cases}
+                      onChange={(e) => setBarcodeForm({ ...barcodeForm, cases: e.target.value })}
+                    />
                   </div>
                 </div>
               )}
@@ -587,29 +714,13 @@ export default function InventoryApp() {
                     </div>
                     <div>
                       <label style={labelStyle}>Cases received</label>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <button
-                          type="button"
-                          onClick={() => setBarcodeForm((p) => ({ ...p, cases: String(Math.max(1, Number(p.cases || 1) - 1)) }))}
-                          style={stepperBtnStyle}
-                        >
-                          <Minus size={14} />
-                        </button>
-                        <input
-                          style={{ ...inputStyle, textAlign: "center" }}
-                          type="number"
-                          min="1"
-                          value={barcodeForm.cases}
-                          onChange={(e) => setBarcodeForm({ ...barcodeForm, cases: e.target.value })}
-                        />
-                        <button
-                          type="button"
-                          onClick={() => setBarcodeForm((p) => ({ ...p, cases: String(Number(p.cases || 1) + 1) }))}
-                          style={stepperBtnStyle}
-                        >
-                          <Plus size={14} />
-                        </button>
-                      </div>
+                      <input
+                        style={inputStyle}
+                        type="number"
+                        min="1"
+                        value={barcodeForm.cases}
+                        onChange={(e) => setBarcodeForm({ ...barcodeForm, cases: e.target.value })}
+                      />
                     </div>
                   </div>
                   <div style={{ marginBottom: 16 }}>
@@ -647,7 +758,7 @@ export default function InventoryApp() {
                   </select>
                 </div>
                 <div>
-                  <label style={labelStyle}>Units sold</label>
+                  <label style={labelStyle}>Macarons sold</label>
                   <input style={inputStyle} type="number" min="1" value={outForm.units} onChange={(e) => setOutForm({ ...outForm, units: e.target.value })} />
                 </div>
               </div>
@@ -671,7 +782,7 @@ export default function InventoryApp() {
 
           {/* Add flavor — barcode driven, mirrors Receive Stock */}
           {tab === "flavor" && (
-            <div style={{ background: SURFACE, border: `1px solid ${BORDER}`, borderRadius: 8, padding: 20, marginBottom: 28 }}>
+            <div style={{ background: SURFACE, border: `1px solid ${BORDER}`, borderRadius: 8, padding: 20, marginBottom: 20 }}>
               <div style={{ marginBottom: flavorBarcodeForm.mode ? 14 : 16 }}>
                 <label style={labelStyle}>Scan barcode</label>
                 <input
@@ -686,10 +797,10 @@ export default function InventoryApp() {
                 )}
               </div>
 
-              {flavorBarcodeForm.mode && (
+              {flavorBarcodeForm.mode === "upc" && (
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 16 }}>
                   <div>
-                    <label style={labelStyle}>{flavorBarcodeForm.mode === "upc" ? "Units per clamshell" : "Macarons per case"}</label>
+                    <label style={labelStyle}>Macarons per clamshell</label>
                     <input
                       style={inputStyle}
                       type="number"
@@ -705,9 +816,31 @@ export default function InventoryApp() {
                       value={flavorBarcodeForm.name}
                       onChange={(e) => setFlavorBarcodeForm({ ...flavorBarcodeForm, name: e.target.value })}
                       placeholder="e.g. Pistachio"
+                    />
+                  </div>
+                  <div style={{ gridColumn: "1 / -1" }}>
+                    <label style={labelStyle}>SKU</label>
+                    <input
+                      style={inputStyle}
+                      value={flavorBarcodeForm.sku}
+                      onChange={(e) => setFlavorBarcodeForm({ ...flavorBarcodeForm, sku: e.target.value })}
+                      placeholder="e.g. LEM-CS-06"
                       onKeyDown={(e) => e.key === "Enter" && submitFlavorScan()}
                     />
                   </div>
+                </div>
+              )}
+
+              {flavorBarcodeForm.mode === "internal" && (
+                <div style={{ marginBottom: 16 }}>
+                  <label style={labelStyle}>Flavor name</label>
+                  <input
+                    style={inputStyle}
+                    value={flavorBarcodeForm.name}
+                    onChange={(e) => setFlavorBarcodeForm({ ...flavorBarcodeForm, name: e.target.value })}
+                    placeholder="e.g. Pistachio"
+                    onKeyDown={(e) => e.key === "Enter" && submitFlavorScan()}
+                  />
                 </div>
               )}
 
@@ -717,8 +850,9 @@ export default function InventoryApp() {
                 <div style={{ marginTop: 18, borderTop: `1px solid ${BORDER}`, paddingTop: 14 }}>
                   <div style={{ fontSize: 12.5, color: MUTED, marginBottom: 8 }}>Linked UPCs so far</div>
                   {upcCodes.map((u) => (
-                    <div key={u.upc} style={{ fontSize: 13, display: "flex", justifyContent: "space-between", padding: "5px 0" }}>
+                    <div key={u.upc} style={{ fontSize: 13, display: "flex", justifyContent: "space-between", gap: 10, padding: "5px 0" }}>
                       <span style={{ fontFamily: monoFont }}>{u.upc}</span>
+                      <span style={{ color: MUTED, flex: 1, textAlign: "center" }}>{u.sku || "—"}</span>
                       <span style={{ color: MUTED }}>{flavors.find((f) => f.id === u.flavor_id)?.name || "—"}</span>
                     </div>
                   ))}
@@ -755,7 +889,7 @@ export default function InventoryApp() {
                       />
                     </div>
                     <div>
-                      <label style={labelStyle}>Units per case</label>
+                      <label style={labelStyle}>Macarons per case</label>
                       <input
                         style={inputStyle}
                         type="number"
@@ -765,49 +899,111 @@ export default function InventoryApp() {
                       />
                     </div>
                   </div>
-                  <SubmitButton submitting={submitting} label="Save changes" onClick={submitFlavorEdit} />
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                    <SubmitButton submitting={submitting} label="Save changes" onClick={submitFlavorEdit} />
+                    {!confirmingDeleteFlavor ? (
+                      <button type="button" onClick={() => setConfirmingDeleteFlavor(true)} style={dangerOutlineBtnStyle}>
+                        <Trash2 size={14} />
+                        Delete flavor
+                      </button>
+                    ) : (
+                      <>
+                        <button type="button" onClick={submitFlavorDelete} style={dangerBtnStyle}>
+                          Confirm delete
+                        </button>
+                        <button type="button" onClick={() => setConfirmingDeleteFlavor(false)} style={secondaryBtnStyle}>
+                          Cancel
+                        </button>
+                      </>
+                    )}
+                  </div>
                 </>
               )}
             </div>
           )}
 
-          {/* Current stock */}
-          <div>
-            <div style={{ fontSize: 14.5, fontWeight: 600, marginBottom: 10 }}>Current stock</div>
-            {dataLoading ? (
-              <div style={{ fontSize: 13, color: MUTED, display: "flex", alignItems: "center", gap: 7 }}>
-                <Loader2 size={14} className="animate-spin" /> Refreshing…
+          {/* Current stock — its own section */}
+          {tab === "stock" && (
+            <div>
+              <div style={{ display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
+                <button type="button" onClick={publishCsv} style={secondaryBtnStyle}>
+                  <Send size={14} />
+                  Publish
+                </button>
+                <button type="button" onClick={startTakeInventory} style={secondaryBtnStyle}>
+                  <ClipboardCheck size={14} />
+                  Take inventory
+                </button>
               </div>
-            ) : inventory.length === 0 ? (
-              <div style={{ fontSize: 13, color: MUTED }}>No flavors yet — add one above to get started.</div>
-            ) : (
-              <div style={{ border: `1px solid ${BORDER}`, borderRadius: 8, overflow: "hidden" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1fr", padding: "9px 14px", fontSize: 11.5, color: MUTED, borderBottom: `1px solid ${BORDER}`, background: "#FBF8F3" }}>
-                  <div>Flavor</div>
-                  <div>Received</div>
-                  <div>Sold</div>
-                  <div>On hand</div>
+
+              <div style={{ fontSize: 14.5, fontWeight: 600, marginBottom: 10 }}>Current stock</div>
+              {dataLoading ? (
+                <div style={{ fontSize: 13, color: MUTED, display: "flex", alignItems: "center", gap: 7 }}>
+                  <Loader2 size={14} className="animate-spin" /> Refreshing…
                 </div>
-                {inventory.map((row, i) => (
-                  <div
-                    key={row.flavor_id}
-                    className="duv-row"
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "1.4fr 1fr 1fr 1fr",
-                      padding: "11px 14px",
-                      fontSize: 13.5,
-                      borderBottom: i < inventory.length - 1 ? `1px solid ${BORDER}` : "none",
-                    }}
-                  >
-                    <div>{row.name}</div>
-                    <div style={{ color: MUTED }}>{row.units_received}</div>
-                    <div style={{ color: MUTED }}>{row.units_sold}</div>
-                    <div style={{ fontWeight: 600, color: row.units_on_hand < 0 ? BERRY : INK }}>{row.units_on_hand}</div>
+              ) : inventory.length === 0 ? (
+                <div style={{ fontSize: 13, color: MUTED }}>No flavors yet — add one in the Add Flavor tab to get started.</div>
+              ) : (
+                <div style={{ border: `1px solid ${BORDER}`, borderRadius: 8, overflow: "hidden" }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1fr", padding: "9px 14px", fontSize: 11.5, color: MUTED, borderBottom: `1px solid ${BORDER}`, background: "#FBF8F3" }}>
+                    <div>Flavor</div>
+                    <div>Received</div>
+                    <div>Sold</div>
+                    <div>On hand</div>
                   </div>
-                ))}
-              </div>
-            )}
+                  {inventory.map((row, i) => (
+                    <div
+                      key={row.flavor_id}
+                      className="duv-row"
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "1.4fr 1fr 1fr 1fr",
+                        padding: "11px 14px",
+                        fontSize: 13.5,
+                        borderBottom: i < inventory.length - 1 ? `1px solid ${BORDER}` : "none",
+                      }}
+                    >
+                      <div>{row.name}</div>
+                      <div style={{ color: MUTED }}>{row.units_received}</div>
+                      <div style={{ color: MUTED }}>{row.units_sold}</div>
+                      <div style={{ fontWeight: 600, color: row.units_on_hand < 0 ? BERRY : INK }}>{row.units_on_hand}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Take Inventory — full-screen step-through */}
+      {takingInventory && (
+        <div style={{ position: "fixed", inset: 0, background: PAPER, zIndex: 50, display: "flex", flexDirection: "column", padding: "28px 22px", fontFamily: sansFont, color: INK }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", maxWidth: 480, margin: "0 auto 30px", width: "100%" }}>
+            <div style={{ fontSize: 13, color: MUTED }}>
+              Flavor {inventoryStep + 1} of {flavors.length}
+            </div>
+            <button onClick={cancelTakeInventory} style={{ background: "none", border: "none", cursor: "pointer", color: MUTED }} aria-label="Cancel">
+              <X size={18} />
+            </button>
+          </div>
+          <div style={{ maxWidth: 480, margin: "0 auto", width: "100%", flex: 1, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+            <div style={{ fontFamily: serifFont, fontSize: 28, marginBottom: 22, textAlign: "center" }}>{flavors[inventoryStep]?.name}</div>
+            <label style={labelStyle}>Macarons on hand</label>
+            <input
+              style={{ ...inputStyle, fontSize: 20, textAlign: "center", padding: "14px 11px", marginBottom: 20 }}
+              type="number"
+              min="0"
+              value={currentCountInput}
+              onChange={(e) => setCurrentCountInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleInventoryNext()}
+              autoFocus
+            />
+            <SubmitButton
+              submitting={submitting}
+              label={inventoryStep + 1 < flavors.length ? "Next" : "Finish"}
+              onClick={handleInventoryNext}
+            />
           </div>
         </div>
       )}
@@ -829,6 +1025,7 @@ export default function InventoryApp() {
             alignItems: "center",
             gap: 8,
             boxShadow: "0 4px 14px rgba(0,0,0,0.15)",
+            zIndex: 60,
           }}
         >
           {toast.type === "ok" ? <Check size={15} /> : <AlertCircle size={15} />}
