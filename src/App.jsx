@@ -36,8 +36,10 @@ export default function InventoryApp() {
   const barcodeInputRef = useRef(null);
 
   const [outForm, setOutForm] = useState({ flavor_id: "", units: "", order: "", date: todayStr(), item: "" });
-  const [flavorForm, setFlavorForm] = useState({ name: "", unitsPerCase: "12", sku: "" });
-  const [upcLinkForm, setUpcLinkForm] = useState({ flavor_id: "", upc: "" });
+
+  // Add Flavor is now barcode-driven, mirroring Receive Stock.
+  const [flavorBarcodeForm, setFlavorBarcodeForm] = useState({ code: "", mode: null, unitsPerCase: "", name: "" });
+  const flavorBarcodeInputRef = useRef(null);
 
   const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState(null); // { type: 'ok'|'err', text }
@@ -55,9 +57,9 @@ export default function InventoryApp() {
   useEffect(() => {
     (async () => {
       try {
-        const raw = localStorage.getItem(CONFIG_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
+        const res = await window.storage.get(CONFIG_KEY);
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
           setConfig(parsed);
           setConfigDraft(parsed);
         } else {
@@ -129,7 +131,7 @@ export default function InventoryApp() {
       return;
     }
     try {
-      localStorage.setItem(CONFIG_KEY, JSON.stringify(trimmed));
+      await window.storage.set(CONFIG_KEY, JSON.stringify(trimmed));
     } catch {
       // still proceed even if persistence fails this session
     }
@@ -250,51 +252,58 @@ export default function InventoryApp() {
     }
   }
 
-  async function submitFlavor() {
-    if (!flavorForm.name.trim()) {
-      showToast("err", "Give the flavor a name.");
+  function handleFlavorBarcodeChange(value) {
+    const trimmed = value.trim();
+    let mode = null;
+    if (UPC_PATTERN.test(trimmed)) mode = "upc";
+    else if (trimmed.length > 12) mode = "internal";
+    setFlavorBarcodeForm((prev) => ({ ...prev, code: value, mode }));
+  }
+
+  async function submitFlavorScan() {
+    const mode = flavorBarcodeForm.mode;
+    if (!mode) {
+      showToast("err", "Scan a barcode to continue.");
+      return;
+    }
+    if (!flavorBarcodeForm.name.trim()) {
+      showToast("err", "Enter the flavor name.");
+      return;
+    }
+    const units = Number(flavorBarcodeForm.unitsPerCase);
+    if (!units || units <= 0) {
+      showToast("err", mode === "upc" ? "Enter units per clamshell." : "Enter macarons per case.");
       return;
     }
     setSubmitting(true);
     try {
-      await sbFetch("flavors", {
+      const inserted = await sbFetch("flavors", {
         method: "POST",
         body: JSON.stringify([
           {
-            name: flavorForm.name.trim(),
-            units_per_case: Number(flavorForm.unitsPerCase) || 12,
-            sku: flavorForm.sku || null,
+            name: flavorBarcodeForm.name.trim(),
+            units_per_case: units,
+            sku: flavorBarcodeForm.code.trim(),
           },
         ]),
       });
-      showToast("ok", `${flavorForm.name.trim()} added.`);
-      setFlavorForm({ name: "", unitsPerCase: "12", sku: "" });
+      const newFlavor = inserted && inserted[0];
+
+      if (mode === "upc" && newFlavor) {
+        await sbFetch("upc_codes", {
+          method: "POST",
+          body: JSON.stringify([{ upc: flavorBarcodeForm.code.trim(), flavor_id: newFlavor.id }]),
+        });
+      }
+
+      showToast("ok", `${flavorBarcodeForm.name.trim()} added.`);
+      setFlavorBarcodeForm({ code: "", mode: null, unitsPerCase: "", name: "" });
       loadData();
     } catch (e) {
       showToast("err", e.message || "Couldn't add that flavor.");
     } finally {
       setSubmitting(false);
-    }
-  }
-
-  async function submitUpcLink() {
-    if (!upcLinkForm.flavor_id || !UPC_PATTERN.test(upcLinkForm.upc.trim())) {
-      showToast("err", "Pick a flavor and enter a 12-digit UPC.");
-      return;
-    }
-    setSubmitting(true);
-    try {
-      await sbFetch("upc_codes", {
-        method: "POST",
-        body: JSON.stringify([{ flavor_id: upcLinkForm.flavor_id, upc: upcLinkForm.upc.trim() }]),
-      });
-      showToast("ok", "UPC linked.");
-      setUpcLinkForm({ flavor_id: "", upc: "" });
-      loadData();
-    } catch (e) {
-      showToast("err", e.message || "Couldn't link that UPC.");
-    } finally {
-      setSubmitting(false);
+      flavorBarcodeInputRef.current?.focus();
     }
   }
 
@@ -593,66 +602,62 @@ export default function InventoryApp() {
             </div>
           )}
 
-          {/* Add flavor + UPC linking */}
+          {/* Add flavor — barcode driven, mirrors Receive Stock */}
           {tab === "flavor" && (
-            <>
-              <div style={{ background: SURFACE, border: `1px solid ${BORDER}`, borderRadius: 8, padding: 20, marginBottom: 20 }}>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
-                  <div>
-                    <label style={labelStyle}>Flavor name</label>
-                    <input style={inputStyle} value={flavorForm.name} onChange={(e) => setFlavorForm({ ...flavorForm, name: e.target.value })} placeholder="e.g. Pistachio" />
-                  </div>
-                  <div>
-                    <label style={labelStyle}>Units per case</label>
-                    <input style={inputStyle} type="number" min="1" value={flavorForm.unitsPerCase} onChange={(e) => setFlavorForm({ ...flavorForm, unitsPerCase: e.target.value })} />
-                  </div>
-                </div>
-                <div style={{ marginBottom: 16 }}>
-                  <label style={labelStyle}>SKU (optional)</label>
-                  <input style={inputStyle} value={flavorForm.sku} onChange={(e) => setFlavorForm({ ...flavorForm, sku: e.target.value })} />
-                </div>
-                <SubmitButton submitting={submitting} label="Add flavor" onClick={submitFlavor} />
+            <div style={{ background: SURFACE, border: `1px solid ${BORDER}`, borderRadius: 8, padding: 20, marginBottom: 28 }}>
+              <div style={{ marginBottom: flavorBarcodeForm.mode ? 14 : 16 }}>
+                <label style={labelStyle}>Scan barcode</label>
+                <input
+                  ref={flavorBarcodeInputRef}
+                  style={{ ...inputStyle, fontFamily: monoFont, letterSpacing: 0.5 }}
+                  placeholder="Scan a UPC or internal code…"
+                  value={flavorBarcodeForm.code}
+                  onChange={(e) => handleFlavorBarcodeChange(e.target.value)}
+                />
+                {!flavorBarcodeForm.mode && flavorBarcodeForm.code && (
+                  <div style={{ fontSize: 12.5, color: MUTED, marginTop: 6 }}>Keep scanning…</div>
+                )}
               </div>
 
-              <div style={{ background: SURFACE, border: `1px solid ${BORDER}`, borderRadius: 8, padding: 20, marginBottom: 28 }}>
-                <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>Link a UPC to a flavor</div>
+              {flavorBarcodeForm.mode && (
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 16 }}>
                   <div>
-                    <label style={labelStyle}>Flavor</label>
-                    <select style={inputStyle} value={upcLinkForm.flavor_id} onChange={(e) => setUpcLinkForm({ ...upcLinkForm, flavor_id: e.target.value })}>
-                      <option value="">Select…</option>
-                      {flavors.map((f) => (
-                        <option key={f.id} value={f.id}>
-                          {f.name}
-                        </option>
-                      ))}
-                    </select>
+                    <label style={labelStyle}>{flavorBarcodeForm.mode === "upc" ? "Units per clamshell" : "Macarons per case"}</label>
+                    <input
+                      style={inputStyle}
+                      type="number"
+                      min="1"
+                      value={flavorBarcodeForm.unitsPerCase}
+                      onChange={(e) => setFlavorBarcodeForm({ ...flavorBarcodeForm, unitsPerCase: e.target.value })}
+                    />
                   </div>
                   <div>
-                    <label style={labelStyle}>UPC (12 digits)</label>
+                    <label style={labelStyle}>Flavor name</label>
                     <input
-                      style={{ ...inputStyle, fontFamily: monoFont }}
-                      value={upcLinkForm.upc}
-                      onChange={(e) => setUpcLinkForm({ ...upcLinkForm, upc: e.target.value })}
-                      placeholder="851091004046"
+                      style={inputStyle}
+                      value={flavorBarcodeForm.name}
+                      onChange={(e) => setFlavorBarcodeForm({ ...flavorBarcodeForm, name: e.target.value })}
+                      placeholder="e.g. Pistachio"
+                      onKeyDown={(e) => e.key === "Enter" && submitFlavorScan()}
                     />
                   </div>
                 </div>
-                <SubmitButton submitting={submitting} label="Link UPC" onClick={submitUpcLink} />
+              )}
 
-                {upcCodes.length > 0 && (
-                  <div style={{ marginTop: 18, borderTop: `1px solid ${BORDER}`, paddingTop: 14 }}>
-                    <div style={{ fontSize: 12.5, color: MUTED, marginBottom: 8 }}>Linked so far</div>
-                    {upcCodes.map((u) => (
-                      <div key={u.upc} style={{ fontSize: 13, display: "flex", justifyContent: "space-between", padding: "5px 0" }}>
-                        <span style={{ fontFamily: monoFont }}>{u.upc}</span>
-                        <span style={{ color: MUTED }}>{flavors.find((f) => f.id === u.flavor_id)?.name || "—"}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </>
+              <SubmitButton submitting={submitting} label="Add flavor" onClick={submitFlavorScan} />
+
+              {upcCodes.length > 0 && (
+                <div style={{ marginTop: 18, borderTop: `1px solid ${BORDER}`, paddingTop: 14 }}>
+                  <div style={{ fontSize: 12.5, color: MUTED, marginBottom: 8 }}>Linked UPCs so far</div>
+                  {upcCodes.map((u) => (
+                    <div key={u.upc} style={{ fontSize: 13, display: "flex", justifyContent: "space-between", padding: "5px 0" }}>
+                      <span style={{ fontFamily: monoFont }}>{u.upc}</span>
+                      <span style={{ color: MUTED }}>{flavors.find((f) => f.id === u.flavor_id)?.name || "—"}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
 
           {/* Current stock */}
